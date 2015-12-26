@@ -31,5 +31,9 @@ WORKDIR /go/src/github.com/letsencrypt/boulder
 # Copy in the Boulder sources
 COPY . /go/src/github.com/letsencrypt/boulder
 
+## Use specific settings for development
+## Should update common secction.
+# COPY ./test/boulder-config.local.json /go/src/github.com/letsencrypt/boulder/test/boulder-config.json
+
 ENTRYPOINT [ "./test/entrypoint.sh" ]
 CMD [ "./start.py" ]
