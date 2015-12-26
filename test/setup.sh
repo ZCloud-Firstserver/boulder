@@ -4,6 +4,8 @@
 # and configure database and RabbitMQ.
 #
 
+set -x
+
 go get \
   golang.org/x/tools/cmd/vet \
   golang.org/x/tools/cmd/cover \
@@ -20,7 +22,7 @@ go get \
  ./test/create_db.sh) &
 
 # Set up rabbitmq exchange and activity monitor queue
-go run cmd/rabbitmq-setup/main.go -server amqp://localhost &
+go run cmd/rabbitmq-setup/main.go -server amqp://rabbitmq &
 
 # Wait for all the background commands to finish.
 wait
