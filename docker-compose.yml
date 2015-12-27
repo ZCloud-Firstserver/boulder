@@ -3,6 +3,8 @@ boulder:
     dockerfile: Dockerfile
     ports:
         - "4000:4000"
+          #- "4001:4001"
+        - "4002:4002"
     environment:
         MYSQL_CONTAINER: "yes"
     links:
@@ -14,6 +16,8 @@ mysql:
         - "3306"
     environment:
         MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    volumes:
+        -  /srv/docker_voumes/mariadb10:/var/lib/mysql
 rabbitmq:
     image: rabbitmq:3
     expose:
