@@ -34,6 +34,9 @@ COPY . /go/src/github.com/letsencrypt/boulder
 ## Use specific settings for development
 ## Should update common secction.
 COPY ./local/boulder-config.local.json /go/src/github.com/letsencrypt/boulder/test/boulder-config.json
+COPY ./local/rate-limit-policies.yml /go/src/github.com/letsencrypt/boulder/test/rate-limit-policies.yml
+COPY ./local/cakey.pem /go/src/github.com/letsencrypt/boulder/test/test-ca.key
+COPY ./local/cacert.pem /go/src/github.com/letsencrypt/boulder/test/test-ca.pem
 
 ENTRYPOINT [ "./test/entrypoint.sh" ]
 CMD [ "./start.py" ]
