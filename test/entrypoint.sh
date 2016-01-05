@@ -15,6 +15,12 @@ if [[ -z "$MYSQL_CONTAINER" ]]; then
       sleep 1
   done
 
+  # make sure we can reach the rabbitmq
+  while ! exec 6<>/dev/tcp/0.0.0.0/5672; do
+      echo "$(date) - still trying to connect to rabbitmq at 0.0.0.0:5672"
+      sleep 1
+  done
+
   exec 6>&-
   exec 6<&-
 else
@@ -27,5 +33,8 @@ fi
 # create the database
 source $DIR/create_db.sh
 $DIR/setup.sh
+
+# Set up rabbitmq exchange and activity monitor queue
+go run cmd/rabbitmq-setup/main.go -server amqp://localhost
 
 $@
