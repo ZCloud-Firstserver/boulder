@@ -35,6 +35,6 @@ source $DIR/create_db.sh
 $DIR/setup.sh
 
 # Set up rabbitmq exchange and activity monitor queue
-go run cmd/rabbitmq-setup/main.go -server amqp://localhost
+go run cmd/rabbitmq-setup/main.go -server amqp://rabbitmq
 
 $@
