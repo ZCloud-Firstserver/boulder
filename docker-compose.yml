@@ -11,7 +11,7 @@ boulder:
       - mysql
       - rabbitmq
 mysql:
-    image: mariadb:10
+    image: mariadb:10.0
     expose:
         - "3306"
     environment:
