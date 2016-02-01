@@ -483,7 +483,7 @@ func (va *ValidationAuthorityImpl) validate(ctx context.Context, authz core.Auth
 	}
 	challenge := &authz.Challenges[challengeIndex]
 	vStart := va.clk.Now()
-	validationRecords, prob := va.validateChallengeAndCAA(authz.Identifier, *challenge, authz.RegistrationID)
+	validationRecords, prob := va.validateChallengeAndCAA(ctx, authz.Identifier, *challenge, authz.RegistrationID)
 	va.stats.TimingDuration(fmt.Sprintf("VA.Validations.%s.%s", challenge.Type, challenge.Status), time.Since(vStart), 1.0)
 
 	challenge.ValidationRecord = validationRecords
