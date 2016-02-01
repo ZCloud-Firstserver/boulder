@@ -483,23 +483,22 @@ func (va *ValidationAuthorityImpl) validate(ctx context.Context, authz core.Auth
 	}
 	challenge := &authz.Challenges[challengeIndex]
 	vStart := va.clk.Now()
-	validationRecords, _ := va.validateChallengeAndCAA(ctx, authz.Identifier, *challenge, authz.RegistrationID)
+	validationRecords, prob := va.validateChallengeAndCAA(authz.Identifier, *challenge, authz.RegistrationID)
 	va.stats.TimingDuration(fmt.Sprintf("VA.Validations.%s.%s", challenge.Type, challenge.Status), time.Since(vStart), 1.0)
 
 	challenge.ValidationRecord = validationRecords
-	//if prob != nil {
-	//	challenge.Status = core.StatusInvalid
-	//	challenge.Error = prob
-	//	logEvent.Error = prob.Error()
-	//} else if !authz.Challenges[challengeIndex].RecordsSane() {
-	//	challenge.Status = core.StatusInvalid
-	//	challenge.Error = &probs.ProblemDetails{Type: probs.ServerInternalProblem,
-	//		Detail: "Records for validation failed sanity check"}
-	//	logEvent.Error = challenge.Error.Error()
-	//} else {
-	//	challenge.Status = core.StatusValid
-	//}
-	challenge.Status = core.StatusValid
+	if prob != nil {
+		challenge.Status = core.StatusInvalid
+		challenge.Error = prob
+		logEvent.Error = prob.Error()
+	} else if !authz.Challenges[challengeIndex].RecordsSane() {
+		challenge.Status = core.StatusInvalid
+		challenge.Error = &probs.ProblemDetails{Type: probs.ServerInternalProblem,
+			Detail: "Records for validation failed sanity check"}
+		logEvent.Error = challenge.Error.Error()
+	} else {
+		challenge.Status = core.StatusValid
+	}
 	logEvent.Challenge = *challenge
 
 	// AUDIT[ Certificate Requests ] 11917fa4-10ef-4e0d-9105-bacbe7836a3c
