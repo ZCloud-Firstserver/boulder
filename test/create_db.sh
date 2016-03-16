@@ -30,9 +30,20 @@ for svc in $SERVICES; do
 		goose -path=./$svc/_db/ -env=$dbenv up || die "unable to migrate ${db}"
 		echo "migrated ${db} database"
 
+		# With MYSQL_CONTAINER, patch the GRANT statements to
+		# use 127.0.0.1, not localhost, as MySQL may interpret
+		# 'username'@'localhost' to mean only users for UNIX
+		# socket connections.
 		USERS_SQL=test/${svc}_db_users.sql
-		if [[ -f "$USERS_SQL" ]]; then
-			mysql $dbconn -D $db < $USERS_SQL || die "unable to add users to ${db}"
+		if [[ -f $USERS_SQL ]]; then
+			if [[ $MYSQL_CONTAINER ]]; then
+				sed -e "s/'localhost'/'127.0.0.1'/g" < $USERS_SQL | \
+					mysql $dbconn -D $db || \
+					die "unable to add users to ${db}"
+			else
+				mysql $dbconn -D $db < $USERS_SQL || \
+					die "unable to add users to ${db}"
+			fi
 			echo "added users to ${db}"
 		fi
 		) &

@@ -232,6 +232,51 @@ func (ssa *SQLStorageAuthority) GetLatestValidAuthorization(registrationID int64
 	return ssa.GetAuthorization(auth.ID)
 }
 
+// GetValidAuthorizations returns the latest authorization object for all
+// domain names from the parameters that the account has authorizations for.
+func (ssa *SQLStorageAuthority) GetValidAuthorizations(registrationID int64, names []string, now time.Time) (latest map[string]*core.Authorization, err error) {
+	if len(names) == 0 {
+		return nil, errors.New("GetValidAuthorizations: no names received")
+	}
+
+	params := make([]interface{}, len(names))
+	qmarks := make([]string, len(names))
+	for i, name := range names {
+		id := core.AcmeIdentifier{Type: core.IdentifierDNS, Value: name}
+		idJSON, err := json.Marshal(id)
+		if err != nil {
+			return nil, err
+		}
+		params[i] = string(idJSON)
+		qmarks[i] = "?"
+	}
+
+	var auths []*core.Authorization
+	_, err = ssa.dbMap.Select(&auths, `
+		SELECT * FROM authz
+		WHERE registrationID = ?
+		AND expires > ?
+		AND identifier IN (`+strings.Join(qmarks, ",")+`)
+		AND status = 'valid'
+		ORDER BY expires ASC
+		`, append([]interface{}{registrationID, now}, params...)...)
+	if err != nil {
+		return nil, err
+	}
+
+	byName := make(map[string]*core.Authorization)
+	for _, auth := range auths {
+		if auth.Identifier.Type != core.IdentifierDNS {
+			return nil, fmt.Errorf("unknown identifier type: %q on authz id %q", auth.Identifier.Type, auth.ID)
+		}
+		// Due to ORDER BY expires, this results in the latest value
+		// for each name being used.
+		byName[auth.Identifier.Value] = auth
+	}
+
+	return byName, nil
+}
+
 // incrementIP returns a copy of `ip` incremented at a bit index `index`,
 // or in other words the first IP of the next highest subnet given a mask of
 // length `index`.
@@ -738,14 +783,6 @@ func (ssa *SQLStorageAuthority) AddCertificate(certDER []byte, regID int64) (dig
 		RevokedReason:      0,
 		LockCol:            0,
 	}
-	issuedNames := make([]issuedNameModel, len(parsedCertificate.DNSNames))
-	for i, name := range parsedCertificate.DNSNames {
-		issuedNames[i] = issuedNameModel{
-			ReversedName: core.ReverseName(name),
-			Serial:       serial,
-			NotBefore:    parsedCertificate.NotBefore,
-		}
-	}
 
 	tx, err := ssa.dbMap.Begin()
 	if err != nil {
@@ -765,12 +802,10 @@ func (ssa *SQLStorageAuthority) AddCertificate(certDER []byte, regID int64) (dig
 		return
 	}
 
-	for _, issuedName := range issuedNames {
-		err = tx.Insert(&issuedName)
-		if err != nil {
-			tx.Rollback()
-			return
-		}
+	err = addIssuedNames(tx, parsedCertificate)
+	if err != nil {
+		tx.Rollback()
+		return
 	}
 
 	err = addFQDNSet(
@@ -897,6 +932,25 @@ func addFQDNSet(tx *gorp.Transaction, names []string, serial string, issued time
 	})
 }
 
+type execable interface {
+	Exec(string, ...interface{}) (sql.Result, error)
+}
+
+func addIssuedNames(tx execable, cert *x509.Certificate) error {
+	var qmarks []string
+	var values []interface{}
+	for _, name := range cert.DNSNames {
+		values = append(values,
+			core.ReverseName(name),
+			core.SerialToString(cert.SerialNumber),
+			cert.NotBefore)
+		qmarks = append(qmarks, "(?, ?, ?)")
+	}
+	query := `INSERT INTO issuedNames (reversedName, serial, notBefore) VALUES ` + strings.Join(qmarks, ", ") + `;`
+	_, err := tx.Exec(query, values...)
+	return err
+}
+
 // CountFQDNSets returns the number of sets with hash |setHash| within the window
 // |window|
 func (ssa *SQLStorageAuthority) CountFQDNSets(window time.Duration, names []string) (int64, error) {
@@ -904,10 +958,24 @@ func (ssa *SQLStorageAuthority) CountFQDNSets(window time.Duration, names []stri
 	err := ssa.dbMap.SelectOne(
 		&count,
 		`SELECT COUNT(1) FROM fqdnSets
-     WHERE setHash = ?
-     AND issued > ?`,
+		WHERE setHash = ?
+		AND issued > ?`,
 		hashNames(names),
 		ssa.clk.Now().Add(-window),
 	)
 	return count, err
+}
+
+// FQDNSetExists returns a bool indicating if one or more FQDN sets |names|
+// exists in the database
+func (ssa *SQLStorageAuthority) FQDNSetExists(names []string) (bool, error) {
+	var count int64
+	err := ssa.dbMap.SelectOne(
+		&count,
+		`SELECT COUNT(1) FROM fqdnSets
+		WHERE setHash = ?
+		LIMIT 1`,
+		hashNames(names),
+	)
+	return count > 0, err
 }

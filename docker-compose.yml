@@ -1,3 +1,4 @@
+# see comments in test/run-docker.sh about host networking
 boulder:
     build: .
     dockerfile: Dockerfile

@@ -53,6 +53,7 @@ type Config struct {
 
 	RA struct {
 		ServiceConfig
+		HostnamePolicyConfig
 
 		RateLimitPoliciesFilename string
 
@@ -308,6 +309,7 @@ func (a *AMQPConfig) ServerURL() (string, error) {
 type CAConfig struct {
 	ServiceConfig
 	DBConfig
+	HostnamePolicyConfig
 
 	Profile      string
 	RSAProfile   string
@@ -327,8 +329,6 @@ type CAConfig struct {
 
 	MaxConcurrentRPCServerRequests int64
 
-	HSMFaultTimeout ConfigDuration
-
 	// DoNotForceCN is a temporary config setting. It controls whether
 	// to add a certificate's serial to its Subject, and whether to
 	// not pull a SAN entry to be the CN if no CN was given in a CSR.
@@ -346,6 +346,12 @@ type PAConfig struct {
 	DBConfig
 	EnforcePolicyWhitelist bool
 	Challenges             map[string]bool
+}
+
+// HostnamePolicyConfig specifies a file from which to load a policy regarding
+// what hostnames to issue for.
+type HostnamePolicyConfig struct {
+	HostnamePolicyFile string
 }
 
 // CheckChallenges checks whether the list of challenges in the PA config
