@@ -1,17 +1,20 @@
-# see comments in test/run-docker.sh about host networking
 boulder:
     build: .
     dockerfile: Dockerfile
     ports:
         - "4000:4000"
-          #- "4001:4001"
+        #- "4001:4001"
         - "4002:4002"
+      - 4003:4003
     environment:
         MYSQL_CONTAINER: "yes"
     links:
-      - mysql
-      - rabbitmq
-mysql:
+      - bmysql:boulder-mysql
+      - brabbitmq:boulder-rabbitmq
+    extra_hosts:
+      - boulder:127.0.0.1
+bmysql:
+    container_name: boulder-mysql
     image: mariadb:10.0
     expose:
         - "3306"
@@ -19,7 +22,9 @@ mysql:
         MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
     volumes:
         -  /srv/docker_voumes/mariadb10:/var/lib/mysql
-rabbitmq:
+brabbitmq:
+    container_name: boulder-rabbitmq
     image: rabbitmq:3
     expose:
         - "5672"
+    log_driver: "none"
