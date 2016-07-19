@@ -2,9 +2,9 @@ boulder:
     build: .
     dockerfile: Dockerfile
     ports:
-        - "4000:4000"
+      - 4000:4000
         #- "4001:4001"
-        - "4002:4002"
+      - 4002:4002
       - 4003:4003
     environment:
         MYSQL_CONTAINER: "yes"
