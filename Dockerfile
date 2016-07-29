@@ -24,8 +24,8 @@ RUN GOBIN=/go/src/github.com/letsencrypt/boulder/bin go install  ./...
 ## Should update common secction.
 COPY ./local/boulder-config.local.json /go/src/github.com/letsencrypt/boulder/test/boulder-config.json
 COPY ./local/rate-limit-policies.yml /go/src/github.com/letsencrypt/boulder/test/rate-limit-policies.yml
-COPY ./local/cakey.pem /go/src/github.com/letsencrypt/boulder/test/test-ca.key
-COPY ./local/cacert.pem /go/src/github.com/letsencrypt/boulder/test/test-ca.pem
+# COPY ./local/cakey.pem /go/src/github.com/letsencrypt/boulder/test/test-ca.key
+# COPY ./local/cacert.pem /go/src/github.com/letsencrypt/boulder/test/test-ca.pem
 
 RUN chown -R buser /go/
 
