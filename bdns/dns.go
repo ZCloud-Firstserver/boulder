@@ -1,15 +1,12 @@
-// Copyright 2015 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package bdns
 
 import (
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmhodges/clock"
@@ -17,6 +14,14 @@ import (
 	"github.com/miekg/dns"
 	"golang.org/x/net/context"
 )
+
+func parseCidr(network string, comment string) net.IPNet {
+	_, net, err := net.ParseCIDR(network)
+	if err != nil {
+		panic(fmt.Sprintf("error parsing %s (%s): %s", network, comment, err))
+	}
+	return *net
+}
 
 var (
 	// Private CIDRs to ignore
@@ -114,6 +119,21 @@ var (
 			Mask: []byte{255, 192, 0, 0},
 		},
 	}
+	// Sourced from https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
+	// where Global, Source, or Destination is False
+	privateV6Networks = []net.IPNet{
+		parseCidr("::/128", "RFC 4291: Unspecified Address"),
+		parseCidr("::1/128", "RFC 4291: Loopback Address"),
+		parseCidr("::ffff:0:0/96", "RFC 4291: IPv4-mapped Address"),
+		parseCidr("100::/64", "RFC 6666: Discard Address Block"),
+		parseCidr("2001::/23", "RFC 2928: IETF Protocol Assignments"),
+		parseCidr("2001:2::/48", "RFC 5180: Benchmarking"),
+		parseCidr("2001:db8::/32", "RFC 3849: Documentation"),
+		parseCidr("2001::/32", "RFC 4380: TEREDO"),
+		parseCidr("fc00::/7", "RFC 4193: Unique-Local"),
+		parseCidr("fe80::/10", "RFC 4291: Section 2.5.6 Link-Scoped Unicast"),
+		parseCidr("ff00::/8", "RFC 4291: Section 2.7"),
+	}
 )
 
 // DNSResolver queries for DNS records
@@ -129,13 +149,18 @@ type DNSResolverImpl struct {
 	dnsClient                exchanger
 	servers                  []string
 	allowRestrictedAddresses bool
-	maxTries                 int
-	clk                      clock.Clock
-	stats                    metrics.Scope
-	txtStats                 metrics.Scope
-	aStats                   metrics.Scope
-	caaStats                 metrics.Scope
-	mxStats                  metrics.Scope
+	// If non-nil, these are already-issued names whose registrar returns SERVFAIL
+	// for CAA queries that get a temporary pass during a notification period.
+	caaSERVFAILExceptions map[string]bool
+	maxTries              int
+	LookupIPv6            bool
+	clk                   clock.Clock
+	stats                 metrics.Scope
+	txtStats              metrics.Scope
+	aStats                metrics.Scope
+	aaaaStats             metrics.Scope
+	caaStats              metrics.Scope
+	mxStats               metrics.Scope
 }
 
 var _ DNSResolver = &DNSResolverImpl{}
@@ -146,7 +171,14 @@ type exchanger interface {
 
 // NewDNSResolverImpl constructs a new DNS resolver object that utilizes the
 // provided list of DNS servers for resolution.
-func NewDNSResolverImpl(readTimeout time.Duration, servers []string, stats metrics.Scope, clk clock.Clock, maxTries int) *DNSResolverImpl {
+func NewDNSResolverImpl(
+	readTimeout time.Duration,
+	servers []string,
+	caaSERVFAILExceptions map[string]bool,
+	stats metrics.Scope,
+	clk clock.Clock,
+	maxTries int,
+) *DNSResolverImpl {
 	// TODO(jmhodges): make constructor use an Option func pattern
 	dnsClient := new(dns.Client)
 
@@ -158,11 +190,13 @@ func NewDNSResolverImpl(readTimeout time.Duration, servers []string, stats metri
 		dnsClient:                dnsClient,
 		servers:                  servers,
 		allowRestrictedAddresses: false,
+		caaSERVFAILExceptions:    caaSERVFAILExceptions,
 		maxTries:                 maxTries,
 		clk:                      clk,
 		stats:                    stats,
 		txtStats:                 stats.NewScope("TXT"),
 		aStats:                   stats.NewScope("A"),
+		aaaaStats:                stats.NewScope("AAAA"),
 		caaStats:                 stats.NewScope("CAA"),
 		mxStats:                  stats.NewScope("MX"),
 	}
@@ -172,7 +206,7 @@ func NewDNSResolverImpl(readTimeout time.Duration, servers []string, stats metri
 // provided list of DNS servers for resolution and will allow loopback addresses.
 // This constructor should *only* be called from tests (unit or integration).
 func NewTestDNSResolverImpl(readTimeout time.Duration, servers []string, stats metrics.Scope, clk clock.Clock, maxTries int) *DNSResolverImpl {
-	resolver := NewDNSResolverImpl(readTimeout, servers, stats, clk, maxTries)
+	resolver := NewDNSResolverImpl(readTimeout, servers, nil, stats, clk, maxTries)
 	resolver.allowRestrictedAddresses = true
 	return resolver
 }
@@ -283,26 +317,68 @@ func isPrivateV4(ip net.IP) bool {
 	return false
 }
 
-// LookupHost sends a DNS query to find all A records associated with the
-// provided hostname. This method assumes that the external resolver will chase
-// CNAME/DNAME aliases and return relevant A records.  It will retry requests in
-// the case of temporary network errors. It can return net package,
-// context.Canceled, and context.DeadlineExceeded errors.
-func (dnsResolver *DNSResolverImpl) LookupHost(ctx context.Context, hostname string) ([]net.IP, error) {
-	var addrs []net.IP
-	dnsType := dns.TypeA
-	r, err := dnsResolver.exchangeOne(ctx, hostname, dnsType, dnsResolver.aStats)
-	if err != nil {
-		return addrs, &DNSError{dnsType, hostname, err, -1}
+func isPrivateV6(ip net.IP) bool {
+	for _, net := range privateV6Networks {
+		if net.Contains(ip) {
+			return true
+		}
 	}
-	if r.Rcode != dns.RcodeSuccess {
-		return nil, &DNSError{dnsType, hostname, nil, r.Rcode}
+	return false
+}
+
+func (dnsResolver *DNSResolverImpl) lookupIP(ctx context.Context, hostname string, ipType uint16, stats metrics.Scope) ([]dns.RR, error) {
+	resp, err := dnsResolver.exchangeOne(ctx, hostname, ipType, stats)
+	if err != nil {
+		return nil, &DNSError{ipType, hostname, err, -1}
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		return nil, &DNSError{ipType, hostname, nil, resp.Rcode}
+	}
+	return resp.Answer, nil
+}
+
+// LookupHost sends a DNS query to find all A and AAAA records associated with
+// the provided hostname. This method assumes that the external resolver will
+// chase CNAME/DNAME aliases and return relevant records.  It will retry
+// requests in the case of temporary network errors. It can return net package,
+// context.Canceled, and context.DeadlineExceeded errors, all wrapped in the
+// DNSError type.
+func (dnsResolver *DNSResolverImpl) LookupHost(ctx context.Context, hostname string) ([]net.IP, error) {
+	var recordsA, recordsAAAA []dns.RR
+	var errA, errAAAA error
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		recordsA, errA = dnsResolver.lookupIP(ctx, hostname, dns.TypeA, dnsResolver.aStats)
+	}()
+	if dnsResolver.LookupIPv6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			recordsAAAA, errAAAA = dnsResolver.lookupIP(ctx, hostname, dns.TypeAAAA, dnsResolver.aaaaStats)
+		}()
+	}
+	wg.Wait()
+
+	if errA != nil && (errAAAA != nil || !dnsResolver.LookupIPv6) {
+		return nil, errA
 	}
 
-	for _, answer := range r.Answer {
-		if answer.Header().Rrtype == dnsType {
+	var addrs []net.IP
+
+	for _, answer := range recordsA {
+		if answer.Header().Rrtype == dns.TypeA {
 			if a, ok := answer.(*dns.A); ok && a.A.To4() != nil && (!isPrivateV4(a.A) || dnsResolver.allowRestrictedAddresses) {
 				addrs = append(addrs, a.A)
+			}
+		}
+	}
+	for _, answer := range recordsAAAA {
+		if answer.Header().Rrtype == dns.TypeAAAA {
+			if aaaa, ok := answer.(*dns.AAAA); ok && aaaa.AAAA.To16() != nil && (!isPrivateV6(aaaa.AAAA) || dnsResolver.allowRestrictedAddresses) {
+				addrs = append(addrs, aaaa.AAAA)
 			}
 		}
 	}
@@ -311,8 +387,7 @@ func (dnsResolver *DNSResolverImpl) LookupHost(ctx context.Context, hostname str
 }
 
 // LookupCAA sends a DNS query to find all CAA records associated with
-// the provided hostname. If the response code from the resolver is
-// SERVFAIL an empty slice of CAA records is returned.
+// the provided hostname.
 func (dnsResolver *DNSResolverImpl) LookupCAA(ctx context.Context, hostname string) ([]*dns.CAA, error) {
 	dnsType := dns.TypeCAA
 	r, err := dnsResolver.exchangeOne(ctx, hostname, dnsType, dnsResolver.caaStats)
@@ -320,11 +395,20 @@ func (dnsResolver *DNSResolverImpl) LookupCAA(ctx context.Context, hostname stri
 		return nil, &DNSError{dnsType, hostname, err, -1}
 	}
 
-	// On resolver validation failure, or other server failures, return empty an
-	// set and no error.
+	// If the resolver returns SERVFAIL for a certain list of FQDNs, return an
+	// empty set and no error. We originally granted a pass on SERVFAIL because
+	// Cloudflare's DNS, which is behind a lot of hostnames, returned that code.
+	// That is since fixed, but we have a handful of other domains that still return
+	// SERVFAIL, but will need certificate renewals. After a suitable notice
+	// period we will remove these exceptions.
 	var CAAs []*dns.CAA
 	if r.Rcode == dns.RcodeServerFailure {
-		return CAAs, nil
+		if dnsResolver.caaSERVFAILExceptions == nil ||
+			dnsResolver.caaSERVFAILExceptions[hostname] {
+			return nil, nil
+		} else {
+			return nil, &DNSError{dnsType, hostname, nil, r.Rcode}
+		}
 	}
 
 	for _, answer := range r.Answer {
@@ -357,4 +441,23 @@ func (dnsResolver *DNSResolverImpl) LookupMX(ctx context.Context, hostname strin
 	}
 
 	return results, nil
+}
+
+// ReadHostList reads in a newline-separated file and returns a map containing
+// each entry. If the filename is empty, returns a nil map and no error.
+func ReadHostList(filename string) (map[string]bool, error) {
+	if filename == "" {
+		return nil, nil
+	}
+	body, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	var output = make(map[string]bool)
+	for _, v := range strings.Split(string(body), "\n") {
+		if len(v) > 0 {
+			output[v] = true
+		}
+	}
+	return output, nil
 }

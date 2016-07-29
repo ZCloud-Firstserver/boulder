@@ -1,8 +1,3 @@
-// Copyright 2015 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package bdns
 
 import (
@@ -36,7 +31,7 @@ func mockDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	}
 	for _, q := range r.Question {
 		q.Name = strings.ToLower(q.Name)
-		if q.Name == "servfail.com." {
+		if q.Name == "servfail.com." || q.Name == "servfailexception.example.com" {
 			m.Rcode = dns.RcodeServerFailure
 			break
 		}
@@ -59,6 +54,27 @@ func mockDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 				record.AAAA = net.ParseIP("::1")
 				appendAnswer(record)
 			}
+			if q.Name == "dualstack.letsencrypt.org." {
+				record := new(dns.AAAA)
+				record.Hdr = dns.RR_Header{Name: "dualstack.letsencrypt.org.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 0}
+				record.AAAA = net.ParseIP("::1")
+				appendAnswer(record)
+			}
+			if q.Name == "v4error.letsencrypt.org." {
+				record := new(dns.AAAA)
+				record.Hdr = dns.RR_Header{Name: "v4error.letsencrypt.org.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 0}
+				record.AAAA = net.ParseIP("::1")
+				appendAnswer(record)
+			}
+			if q.Name == "v6error.letsencrypt.org." {
+				m.SetRcode(r, dns.RcodeNotImplemented)
+			}
+			if q.Name == "nxdomain.letsencrypt.org." {
+				m.SetRcode(r, dns.RcodeNameError)
+			}
+			if q.Name == "dualstackerror.letsencrypt.org." {
+				m.SetRcode(r, dns.RcodeNotImplemented)
+			}
 		case dns.TypeA:
 			if q.Name == "cps.letsencrypt.org." {
 				record := new(dns.A)
@@ -66,8 +82,26 @@ func mockDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 				record.A = net.ParseIP("127.0.0.1")
 				appendAnswer(record)
 			}
+			if q.Name == "dualstack.letsencrypt.org." {
+				record := new(dns.A)
+				record.Hdr = dns.RR_Header{Name: "dualstack.letsencrypt.org.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0}
+				record.A = net.ParseIP("127.0.0.1")
+				appendAnswer(record)
+			}
+			if q.Name == "v6error.letsencrypt.org." {
+				record := new(dns.A)
+				record.Hdr = dns.RR_Header{Name: "dualstack.letsencrypt.org.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0}
+				record.A = net.ParseIP("127.0.0.1")
+				appendAnswer(record)
+			}
+			if q.Name == "v4error.letsencrypt.org." {
+				m.SetRcode(r, dns.RcodeNotImplemented)
+			}
 			if q.Name == "nxdomain.letsencrypt.org." {
 				m.SetRcode(r, dns.RcodeNameError)
+			}
+			if q.Name == "dualstackerror.letsencrypt.org." {
+				m.SetRcode(r, dns.RcodeRefused)
 			}
 		case dns.TypeCNAME:
 			if q.Name == "cname.letsencrypt.org." {
@@ -137,12 +171,10 @@ func mockDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
 	return
 }
 
-func serveLoopResolver(stopChan chan bool) chan bool {
+func serveLoopResolver(stopChan chan bool) {
 	dns.HandleFunc(".", mockDNSQuery)
-	server := &dns.Server{Addr: dnsLoopbackAddr, Net: "tcp", ReadTimeout: time.Millisecond, WriteTimeout: time.Millisecond}
-	waitChan := make(chan bool, 1)
+	server := &dns.Server{Addr: dnsLoopbackAddr, Net: "tcp", ReadTimeout: time.Second, WriteTimeout: time.Second}
 	go func() {
-		waitChan <- true
 		err := server.ListenAndServe()
 		if err != nil {
 			fmt.Println(err)
@@ -156,13 +188,32 @@ func serveLoopResolver(stopChan chan bool) chan bool {
 			fmt.Println(err)
 		}
 	}()
-	return waitChan
+}
+
+func pollServer() {
+	backoff := time.Duration(200 * time.Millisecond)
+	ctx, _ := context.WithTimeout(context.Background(), time.Duration(5*time.Second))
+	ticker := time.NewTicker(backoff)
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Fprintln(os.Stderr, "Timeout reached while testing for the dns server to come up")
+			os.Exit(1)
+		case <-ticker.C:
+			conn, _ := dns.DialTimeout("tcp", dnsLoopbackAddr, backoff)
+			if conn != nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}
 }
 
 func TestMain(m *testing.M) {
 	stop := make(chan bool, 1)
-	wait := serveLoopResolver(stop)
-	<-wait
+	serveLoopResolver(stop)
+	pollServer()
 	ret := m.Run()
 	stop <- true
 	os.Exit(ret)
@@ -227,6 +278,17 @@ func TestDNSServFail(t *testing.T) {
 	emptyCaa, err := obj.LookupCAA(context.Background(), bad)
 	test.Assert(t, len(emptyCaa) == 0, "Query returned non-empty list of CAA records")
 	test.AssertNotError(t, err, "LookupCAA returned an error")
+
+	// When we turn on enforceCAASERVFAIL, such lookups should fail.
+	obj.caaSERVFAILExceptions = map[string]bool{"servfailexception.example.com": true}
+	emptyCaa, err = obj.LookupCAA(context.Background(), bad)
+	test.Assert(t, len(emptyCaa) == 0, "Query returned non-empty list of CAA records")
+	test.AssertError(t, err, "LookupCAA should have returned an error")
+
+	// Unless they are on the exception list
+	emptyCaa, err = obj.LookupCAA(context.Background(), "servfailexception.example.com")
+	test.Assert(t, len(emptyCaa) == 0, "Query returned non-empty list of CAA records")
+	test.AssertNotError(t, err, "LookupCAA for servfail exception returned an error")
 }
 
 func TestDNSLookupTXT(t *testing.T) {
@@ -245,6 +307,8 @@ func TestDNSLookupTXT(t *testing.T) {
 
 func TestDNSLookupHost(t *testing.T) {
 	obj := NewTestDNSResolverImpl(time.Second*10, []string{dnsLoopbackAddr}, testStats, clock.NewFake(), 1)
+
+	obj.LookupIPv6 = true
 
 	ip, err := obj.LookupHost(context.Background(), "servfail.com")
 	t.Logf("servfail.com - IP: %s, Err: %s", ip, err)
@@ -266,11 +330,75 @@ func TestDNSLookupHost(t *testing.T) {
 	test.AssertNotError(t, err, "Not an error to exist")
 	test.Assert(t, len(ip) == 1, "Should have IP")
 
-	// No IPv6
+	// Single IPv6 address
 	ip, err = obj.LookupHost(context.Background(), "v6.letsencrypt.org")
 	t.Logf("v6.letsencrypt.org - IP: %s, Err: %s", ip, err)
 	test.AssertNotError(t, err, "Not an error to exist")
-	test.Assert(t, len(ip) == 0, "Should not have IPs")
+	test.Assert(t, len(ip) == 1, "Should not have IPs")
+
+	// Both IPv6 and IPv4 address
+	ip, err = obj.LookupHost(context.Background(), "dualstack.letsencrypt.org")
+	t.Logf("dualstack.letsencrypt.org - IP: %s, Err: %s", ip, err)
+	test.AssertNotError(t, err, "Not an error to exist")
+	test.Assert(t, len(ip) == 2, "Should have 2 IPs")
+	expected := net.ParseIP("127.0.0.1")
+	test.Assert(t, ip[0].To4().Equal(expected), "wrong ipv4 address")
+	expected = net.ParseIP("::1")
+	test.Assert(t, ip[1].To16().Equal(expected), "wrong ipv6 address")
+
+	// IPv6 error, IPv4 success
+	ip, err = obj.LookupHost(context.Background(), "v6error.letsencrypt.org")
+	t.Logf("v6error.letsencrypt.org - IP: %s, Err: %s", ip, err)
+	test.AssertNotError(t, err, "Not an error to exist")
+	test.Assert(t, len(ip) == 1, "Should have 1 IP")
+	expected = net.ParseIP("127.0.0.1")
+	test.Assert(t, ip[0].To4().Equal(expected), "wrong ipv4 address")
+
+	// IPv6 success, IPv4 error
+	ip, err = obj.LookupHost(context.Background(), "v4error.letsencrypt.org")
+	t.Logf("v4error.letsencrypt.org - IP: %s, Err: %s", ip, err)
+	test.AssertNotError(t, err, "Not an error to exist")
+	test.Assert(t, len(ip) == 1, "Should have 1 IP")
+	expected = net.ParseIP("::1")
+	test.Assert(t, ip[0].To16().Equal(expected), "wrong ipv6 address")
+
+	// IPv6 error, IPv4 error
+	// Should return the IPv4 error (Refused) and not IPv6 error (NotImplemented)
+	hostname := "dualstackerror.letsencrypt.org"
+	ip, err = obj.LookupHost(context.Background(), hostname)
+	t.Logf("%s - IP: %s, Err: %s", hostname, ip, err)
+	test.AssertError(t, err, "Should be an error")
+	expectedErr := DNSError{dns.TypeA, hostname, nil, dns.RcodeRefused}
+	if err, ok := err.(*DNSError); !ok || *err != expectedErr {
+		t.Errorf("Looking up %s, got %#v, expected %#v", hostname, err, expectedErr)
+	}
+
+	obj.LookupIPv6 = false
+
+	// Single IPv6 address
+	ip, err = obj.LookupHost(context.Background(), "v6.letsencrypt.org")
+	t.Logf("v6.letsencrypt.org - IP: %s, Err: %s", ip, err)
+	test.AssertNotError(t, err, "Should not be error")
+	test.Assert(t, len(ip) == 0, "Should have no IPs")
+
+	// Both IPv6 and IPv4 address
+	ip, err = obj.LookupHost(context.Background(), "dualstack.letsencrypt.org")
+	t.Logf("dualstack.letsencrypt.org - IP: %s, Err: %s", ip, err)
+	test.AssertNotError(t, err, "Should not be error")
+	test.Assert(t, len(ip) == 1, "Should have 1 IP")
+	expected = net.ParseIP("127.0.0.1")
+	test.Assert(t, ip[0].To4().Equal(expected), "wrong ipv4 address")
+
+	// IPv6 success, IPv4 error
+	hostname = "v4error.letsencrypt.org"
+	ip, err = obj.LookupHost(context.Background(), hostname)
+	t.Logf("v4error.letsencrypt.org - IP: %s, Err: %s", ip, err)
+	test.AssertError(t, err, "Should be error")
+	test.Assert(t, len(ip) == 0, "Should have 0 IPs")
+	expectedErr = DNSError{dns.TypeA, hostname, nil, dns.RcodeNotImplemented}
+	if err, ok := err.(*DNSError); !ok || *err != expectedErr {
+		t.Errorf("Looking up %s, got %#v, expected %#v", hostname, err, expectedErr)
+	}
 }
 
 func TestDNSNXDOMAIN(t *testing.T) {
@@ -314,6 +442,37 @@ func TestDNSTXTAuthorities(t *testing.T) {
 	test.AssertNotError(t, err, "TXT lookup failed")
 	test.AssertEquals(t, len(auths), 1)
 	test.AssertEquals(t, auths[0], "letsencrypt.org.	0	IN	SOA	ns.letsencrypt.org. master.letsencrypt.org. 1 1 1 1 1")
+}
+
+func TestIsPrivateIP(t *testing.T) {
+	test.Assert(t, isPrivateV4(net.ParseIP("127.0.0.1")), "should be private")
+	test.Assert(t, isPrivateV4(net.ParseIP("192.168.254.254")), "should be private")
+	test.Assert(t, isPrivateV4(net.ParseIP("10.255.0.3")), "should be private")
+	test.Assert(t, isPrivateV4(net.ParseIP("172.16.255.255")), "should be private")
+	test.Assert(t, isPrivateV4(net.ParseIP("172.31.255.255")), "should be private")
+	test.Assert(t, !isPrivateV4(net.ParseIP("128.0.0.1")), "should be private")
+	test.Assert(t, !isPrivateV4(net.ParseIP("192.169.255.255")), "should not be private")
+	test.Assert(t, !isPrivateV4(net.ParseIP("9.255.0.255")), "should not be private")
+	test.Assert(t, !isPrivateV4(net.ParseIP("172.32.255.255")), "should not be private")
+
+	test.Assert(t, isPrivateV6(net.ParseIP("::0")), "should be private")
+	test.Assert(t, isPrivateV6(net.ParseIP("::1")), "should be private")
+	test.Assert(t, !isPrivateV6(net.ParseIP("::2")), "should not be private")
+
+	test.Assert(t, isPrivateV6(net.ParseIP("fe80::1")), "should be private")
+	test.Assert(t, isPrivateV6(net.ParseIP("febf::1")), "should be private")
+	test.Assert(t, !isPrivateV6(net.ParseIP("fec0::1")), "should not be private")
+	test.Assert(t, !isPrivateV6(net.ParseIP("feff::1")), "should not be private")
+
+	test.Assert(t, isPrivateV6(net.ParseIP("ff00::1")), "should be private")
+	test.Assert(t, isPrivateV6(net.ParseIP("ff10::1")), "should be private")
+	test.Assert(t, isPrivateV6(net.ParseIP("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")), "should be private")
+
+	test.Assert(t, !isPrivateV6(net.ParseIP("2002::")), "should not be private")
+	test.Assert(t, !isPrivateV6(net.ParseIP("2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff")), "should not be private")
+	test.Assert(t, isPrivateV6(net.ParseIP("0100::")), "should be private")
+	test.Assert(t, isPrivateV6(net.ParseIP("0100::0000:ffff:ffff:ffff:ffff")), "should be private")
+	test.Assert(t, !isPrivateV6(net.ParseIP("0100::0001:0000:0000:0000:0000")), "should be private")
 }
 
 type testExchanger struct {
@@ -504,3 +663,23 @@ type tempError bool
 
 func (t tempError) Temporary() bool { return bool(t) }
 func (t tempError) Error() string   { return fmt.Sprintf("Temporary: %t", t) }
+
+func TestReadHostList(t *testing.T) {
+	res, err := ReadHostList("")
+	if res != nil {
+		t.Errorf("Expected res to be nil")
+	}
+	if err != nil {
+		t.Errorf("Expected err to be nil: %s", err)
+	}
+	res, err = ReadHostList("../test/caa-servfail-exceptions.txt")
+	if err != nil {
+		t.Errorf("Expected err to be nil: %s", err)
+	}
+	if len(res) != 1 {
+		t.Errorf("Wrong size of host list: %d", len(res))
+	}
+	if res["servfailexception.example.com"] != true {
+		t.Errorf("Didn't find servfailexception.example.com in list")
+	}
+}

@@ -13,23 +13,12 @@ fi
 RUN=${RUN:-vet fmt migrations unit integration errcheck}
 
 # The list of segments to hard fail on, as opposed to continuing to the end of
-# the unit tests before failing.  By defuault, we only hard-fail for gofmt,
-# since its errors are common and easy to fix.
-HARDFAIL=${HARDFAIL:-fmt}
+# the unit tests before failing.
+HARDFAIL=${HARDFAIL:-fmt godep-restore}
 
 FAILURE=0
 
 TESTPATHS=$(go list -f '{{ .ImportPath }}' ./... | grep -v /vendor/)
-
-# We need to know, for github-pr-status, what the triggering commit is.
-# Assume first it's the travis commit (for builds of master), unless we're
-# a PR, when it's actually the first parent.
-TRIGGER_COMMIT=${TRAVIS_COMMIT}
-if [ "x${TRAVIS_PULL_REQUEST}" != "x" ] ; then
-  revs=$(git rev-list --parents -n 1 HEAD)
-  # The trigger commit is the last ID in the space-delimited rev-list
-  TRIGGER_COMMIT=${revs##* }
-fi
 
 GITHUB_SECRET_FILE="/tmp/github-secret.json"
 
@@ -50,25 +39,13 @@ end_context() {
   CONTEXT=""
 }
 
-update_status() {
-  if ([ "${TRAVIS}" == "true" ] && [ "x${CONTEXT}" != "x" ]) && [ -f "${GITHUB_SECRET_FILE}" ]; then
-    github-pr-status --authfile $GITHUB_SECRET_FILE \
-      --owner "letsencrypt" --repo "boulder" \
-      status --sha "${TRIGGER_COMMIT}" --context "${CONTEXT}" \
-      --url "https://travis-ci.org/letsencrypt/boulder/builds/${TRAVIS_BUILD_ID}" $*
-  fi
-}
-
 function run() {
   echo "$@"
   "$@" 2>&1
   local status=$?
 
-  if [ ${status} -eq 0 ]; then
-    update_status --state success
-  else
+  if [ "${status}" != 0 ]; then
     FAILURE=1
-    update_status --state failure
     echo "[!] FAILURE: $@"
   fi
 
@@ -84,15 +61,6 @@ function run_and_comment() {
   if [ -s ${result_file} ]; then
     echo "[!] FAILURE: $@"
     FAILURE=1
-    update_status --state failure
-    # If this is a travis PR run, post a comment
-    if [ "x${TRAVIS}" != "x" ] && [ "${TRAVIS_PULL_REQUEST}" != "false" ] && [ -f "${GITHUB_SECRET_FILE}" ] ; then
-      (echo '```' ; cat ${result_file} ; echo -e '\n```') | github-pr-status --authfile $GITHUB_SECRET_FILE \
-        --owner "letsencrypt" --repo "boulder" \
-        comment --pr "${TRAVIS_PULL_REQUEST}" -b -
-    fi
-  else
-    update_status --state success
   fi
   rm ${result_file}
 }
@@ -102,15 +70,6 @@ function die() {
     echo $1 > /dev/stderr
   fi
   exit 1
-}
-
-function build_letsencrypt() {
-  run git clone \
-    https://www.github.com/letsencrypt/letsencrypt.git \
-    $LETSENCRYPT_PATH || exit 1
-  cd $LETSENCRYPT_PATH
-  run ./tools/venv.sh
-  cd -
 }
 
 function run_unit_tests() {
@@ -132,12 +91,12 @@ function run_unit_tests() {
     done
 
     # Gather all the coverprofiles
-    [ -e $GOBIN/gover ] && run $GOBIN/gover
+    run gover
 
     # We don't use the run function here because sometimes goveralls fails to
     # contact the server and exits with non-zero status, but we don't want to
     # treat that as a failure.
-    [ -e $GOBIN/goveralls ] && $GOBIN/goveralls -coverprofile=gover.coverprofile -service=travis-ci
+    goveralls -v -coverprofile=gover.coverprofile -service=travis-ci
   else
     # When running locally, we skip the -race flag for speedier test runs. We
     # also pass -p 1 to require the tests to run serially instead of in
@@ -149,10 +108,6 @@ function run_unit_tests() {
     run go test -p 1 $GOTESTFLAGS ${TESTPATHS}
   fi
 }
-
-# Path for installed go package binaries. If yours is different, override with
-# GOBIN=/my/path/to/bin ./test.sh
-GOBIN=${GOBIN:-$HOME/gopath/bin}
 
 #
 # Run Go Vet, a correctness-focused static analysis tool
@@ -218,40 +173,26 @@ fi
 if [[ "$RUN" =~ "integration" ]] ; then
   # Set context to integration, and force a pending state
   start_context "integration"
-  update_status --state pending --description "Integration Tests in progress"
 
-  if [ -z "$LETSENCRYPT_PATH" ]; then
-    export LETSENCRYPT_PATH=$(mktemp -d -t leXXXX)
+  if [ -z "$CERTBOT_PATH" ]; then
+    export CERTBOT_PATH=$(mktemp -d -t cbpXXXX)
     echo "------------------------------------------------"
     echo "--- Checking out letsencrypt client is slow. ---"
-    echo "--- Recommend setting \$LETSENCRYPT_PATH to  ---"
+    echo "--- Recommend setting \$CERTBOT_PATH to  ---"
     echo "--- client repo with initialized virtualenv  ---"
     echo "------------------------------------------------"
-    build_letsencrypt
-  elif [ ! -d "${LETSENCRYPT_PATH}" ]; then
-    build_letsencrypt
+    run git clone https://www.github.com/certbot/certbot.git $CERTBOT_PATH || exit 1
   fi
 
-  source ${LETSENCRYPT_PATH}/venv/bin/activate
+  if ! type certbot >/dev/null 2>/dev/null; then
+    source ${CERTBOT_PATH}/${VENV_NAME:-venv}/bin/activate
+  fi
 
   python test/integration-test.py --all
-  case $? in
-    0) # Success
-      update_status --state success
-      ;;
-    1) # Python client failed
-      update_status --state success --description "Python integration failed."
-      FAILURE=1
-      ;;
-    2) # Node client failed
-      update_status --state failure --description "NodeJS integration failed."
-      FAILURE=1
-      ;;
-    *) # Error occurred
-      update_status --state error --description "Unknown error occurred."
-      FAILURE=1
-      ;;
-  esac
+  if [ "$?" != 0 ]; then
+    echo "Integration test failed: $?"
+    FAILURE=1
+  fi
   end_context #integration
 fi
 
@@ -261,16 +202,11 @@ if [[ "$RUN" =~ "godep-restore" ]] ; then
   start_context "godep-restore"
   run_and_comment godep restore
   # Run godep save and do a diff, to ensure that the version we got from
-  # `godep restore` matched what was in the remote repo. We only do this on
-  # builds of the main fork (not PRs from external contributors), because godep
-  # rewrites import paths to the path of the fork we're building from, which
-  # creates spurious diffs if we're not building from the main fork.
-  # Once we switch to Go 1.6's imports and don't need rewriting anymore, we can
-  # do this for all builds.
-  if [[ "${TRAVIS_REPO_SLUG}" == "letsencrypt/boulder" ]] ; then
-    run_and_comment godep save ./...
-    run_and_comment git diff --exit-code
-  fi
+  # `godep restore` matched what was in the remote repo.
+  cp Godeps/Godeps.json Godeps/Godeps.json.head
+  run_and_comment godep save ./...
+  run_and_comment diff <(sed /GodepVersion/d Godeps/Godeps.json.head) <(sed /GodepVersion/d Godeps/Godeps.json)
+  run_and_comment git diff --exit-code -- ./vendor/
   end_context #godep-restore
 fi
 
@@ -307,7 +243,7 @@ if [[ "$RUN" =~ "generate" ]] ; then
   go install ./probs
   go install google.golang.org/grpc/codes
   run_and_comment go generate ${TESTPATHS}
-  run_and_comment git diff --exit-code .
+  run_and_comment git diff --exit-code $(ls | grep -v Godeps)
   end_context #"generate"
 fi
 

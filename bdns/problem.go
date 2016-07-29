@@ -1,8 +1,3 @@
-// Copyright 2015 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package bdns
 
 import (
@@ -46,6 +41,14 @@ func (d DNSError) Error() string {
 		dns.TypeToString[d.recordType], d.hostname)
 }
 
+// Timeout returns true if the underlying error was a timeout
+func (d DNSError) Timeout() bool {
+	if netErr, ok := d.underlying.(*net.OpError); ok {
+		return netErr.Timeout()
+	}
+	return false
+}
+
 const detailDNSTimeout = "query timed out"
 const detailDNSNetFailure = "networking error"
 const detailServerFailure = "server failure at resolver"
@@ -57,13 +60,7 @@ const detailServerFailure = "server failure at resolver"
 // record type and domain given.
 func ProblemDetailsFromDNSError(err error) *probs.ProblemDetails {
 	if dnsErr, ok := err.(*DNSError); ok {
-		return &probs.ProblemDetails{
-			Type:   probs.ConnectionProblem,
-			Detail: dnsErr.Error(),
-		}
+		return probs.ConnectionFailure(dnsErr.Error())
 	}
-	return &probs.ProblemDetails{
-		Type:   probs.ConnectionProblem,
-		Detail: detailServerFailure,
-	}
+	return probs.ConnectionFailure(detailServerFailure)
 }
