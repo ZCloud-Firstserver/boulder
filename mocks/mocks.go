@@ -19,6 +19,7 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/revocation"
 )
 
 // StorageAuthority is a mock
@@ -113,8 +114,7 @@ func (sa *StorageAuthority) GetRegistrationByKey(_ context.Context, jwk jose.Jso
 		panic(err)
 	}
 
-	contactURL, _ := core.ParseAcmeURL("mailto:person@mail.com")
-	contacts := []*core.AcmeURL{contactURL}
+	contacts := []string{"mailto:person@mail.com"}
 
 	if core.KeyDigestEquals(jwk, test1KeyPublic) {
 		return core.Registration{ID: 1, Key: jwk, Agreement: agreementURL, Contact: &contacts}, nil
@@ -221,7 +221,7 @@ func (sa *StorageAuthority) FinalizeAuthorization(_ context.Context, authz core.
 }
 
 // MarkCertificateRevoked is a mock
-func (sa *StorageAuthority) MarkCertificateRevoked(_ context.Context, serial string, reasonCode core.RevocationCode) (err error) {
+func (sa *StorageAuthority) MarkCertificateRevoked(_ context.Context, serial string, reasonCode revocation.Reason) (err error) {
 	return
 }
 
@@ -309,6 +309,11 @@ func (sa *StorageAuthority) CountRegistrationsByIP(_ context.Context, _ net.IP, 
 // CountPendingAuthorizations is a mock
 func (sa *StorageAuthority) CountPendingAuthorizations(_ context.Context, _ int64) (int, error) {
 	return 0, nil
+}
+
+// DeactivateAuthorization is a mock
+func (sa *StorageAuthority) DeactivateAuthorization(_ context.Context, _ string) error {
+	return nil
 }
 
 // Publisher is a mock

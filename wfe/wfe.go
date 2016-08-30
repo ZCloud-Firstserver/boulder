@@ -3,6 +3,7 @@ package wfe
 import (
 	"bytes"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -14,16 +15,18 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
-
 	"github.com/cactus/go-statsd-client/statsd"
 	"github.com/jmhodges/clock"
+	jose "github.com/square/go-jose"
+	"golang.org/x/net/context"
+
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/goodkey"
 	blog "github.com/letsencrypt/boulder/log"
+	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/nonce"
 	"github.com/letsencrypt/boulder/probs"
-	jose "github.com/square/go-jose"
+	"github.com/letsencrypt/boulder/revocation"
 )
 
 // Paths are the ACME-spec identified URL path-segments for various methods
@@ -81,7 +84,9 @@ type WebFrontEndImpl struct {
 	RequestTimeout time.Duration
 
 	// Feature gates
-	CheckMalformedCSR bool
+	CheckMalformedCSR      bool
+	AcceptRevocationReason bool
+	AllowAuthzDeactivation bool
 }
 
 // NewWebFrontEndImpl constructs a web service for Boulder
@@ -91,7 +96,8 @@ func NewWebFrontEndImpl(
 	keyPolicy goodkey.KeyPolicy,
 	logger blog.Logger,
 ) (WebFrontEndImpl, error) {
-	nonceService, err := nonce.NewNonceService()
+	scope := metrics.NewStatsdScope(stats, "WFE")
+	nonceService, err := nonce.NewNonceService(scope)
 	if err != nil {
 		return WebFrontEndImpl{}, err
 	}
@@ -251,7 +257,7 @@ func (wfe *WebFrontEndImpl) Handler() (http.Handler, error) {
 	wfe.HandleFunc(m, newAuthzPath, wfe.NewAuthorization, "POST")
 	wfe.HandleFunc(m, newCertPath, wfe.NewCertificate, "POST")
 	wfe.HandleFunc(m, regPath, wfe.Registration, "POST")
-	wfe.HandleFunc(m, authzPath, wfe.Authorization, "GET")
+	wfe.HandleFunc(m, authzPath, wfe.Authorization, "GET", "POST")
 	wfe.HandleFunc(m, challengePath, wfe.Challenge, "GET", "POST")
 	wfe.HandleFunc(m, certPath, wfe.Certificate, "GET")
 	wfe.HandleFunc(m, revokeCertPath, wfe.RevokeCertificate, "POST")
@@ -511,13 +517,11 @@ func (wfe *WebFrontEndImpl) sendError(response http.ResponseWriter, logEvent *re
 	// Only audit log internal errors so users cannot purposefully cause
 	// auditable events.
 	if prob.Type == probs.ServerInternalProblem {
-		// AUDIT[ Error Conditions ] 9cc4d537-8534-4970-8665-4b382abe82f3
 		wfe.log.AuditErr(fmt.Sprintf("Internal error - %s - %s", prob.Detail, ierr))
 	}
 
 	problemDoc, err := marshalIndent(prob)
 	if err != nil {
-		// AUDIT[ Error Conditions ] 9cc4d537-8534-4970-8665-4b382abe82f3
 		wfe.log.AuditErr(fmt.Sprintf("Could not marshal error message: %s - %+v", err, prob))
 		problemDoc = []byte("{\"detail\": \"Problem marshalling error message.\"}")
 	}
@@ -682,7 +686,8 @@ func (wfe *WebFrontEndImpl) RevokeCertificate(ctx context.Context, logEvent *req
 	}
 
 	type RevokeRequest struct {
-		CertificateDER core.JSONBuffer `json:"certificate"`
+		CertificateDER core.JSONBuffer    `json:"certificate"`
+		Reason         *revocation.Reason `json:"reason"`
 	}
 	var revokeRequest RevokeRequest
 	if err := json.Unmarshal(body, &revokeRequest); err != nil {
@@ -740,8 +745,17 @@ func (wfe *WebFrontEndImpl) RevokeCertificate(ctx context.Context, logEvent *req
 		return
 	}
 
-	// Use revocation code 0, meaning "unspecified"
-	err = wfe.RA.RevokeCertificateWithReg(ctx, *parsedCertificate, 0, registration.ID)
+	reason := revocation.Reason(0)
+	if revokeRequest.Reason != nil && wfe.AcceptRevocationReason {
+		if _, present := revocation.UserAllowedReasons[*revokeRequest.Reason]; !present {
+			logEvent.AddError("unsupported revocation reason code provided")
+			wfe.sendError(response, logEvent, probs.Malformed("unsupported revocation reason code provided"), nil)
+			return
+		}
+		reason = *revokeRequest.Reason
+	}
+
+	err = wfe.RA.RevokeCertificateWithReg(ctx, *parsedCertificate, reason, registration.ID)
 	if err != nil {
 		logEvent.AddError("failed to revoke certificate: %s", err)
 		wfe.sendError(response, logEvent, core.ProblemDetailsForError(err, "Failed to revoke certificate"), err)
@@ -754,11 +768,11 @@ func (wfe *WebFrontEndImpl) RevokeCertificate(ctx context.Context, logEvent *req
 func (wfe *WebFrontEndImpl) logCsr(request *http.Request, cr core.CertificateRequest, registration core.Registration) {
 	var csrLog = struct {
 		ClientAddr   string
-		CsrBase64    []byte
+		CSR          string
 		Registration core.Registration
 	}{
 		ClientAddr:   getClientAddr(request),
-		CsrBase64:    cr.Bytes,
+		CSR:          hex.EncodeToString(cr.Bytes),
 		Registration: registration,
 	}
 	wfe.log.AuditObject("Certificate request", csrLog)
@@ -789,16 +803,16 @@ func (wfe *WebFrontEndImpl) NewCertificate(ctx context.Context, logEvent *reques
 		wfe.sendError(response, logEvent, probs.Malformed("Error unmarshaling certificate request"), err)
 		return
 	}
-	if wfe.CheckMalformedCSR {
-		// Assuming a properly formatted CSR there should be two four byte SEQUENCE
-		// declarations then a two byte integer declaration which defines the version
-		// of the CSR. If those two bytes (at offset 8 and 9) and equal to 2 and 0
-		// then the CSR was generated by a pre-1.0.2 version of OpenSSL with a client
-		// which didn't explicitly set the version causing the integer to be malformed
-		// and encoding/asn1 will refuse to parse it. If this is the case exit early
-		// with a more useful error message.
-		if len(rawCSR.CSR) >= 10 && rawCSR.CSR[8] == 2 && rawCSR.CSR[9] == 0 {
-			logEvent.AddError("Pre-1.0.2 OpenSSL malformed CSR")
+	// Assuming a properly formatted CSR there should be two four byte SEQUENCE
+	// declarations then a two byte integer declaration which defines the version
+	// of the CSR. If those two bytes (at offset 8 and 9) and equal to 2 and 0
+	// then the CSR was generated by a pre-1.0.2 version of OpenSSL with a client
+	// which didn't explicitly set the version causing the integer to be malformed
+	// and encoding/asn1 will refuse to parse it. If this is the case exit early
+	// with a more useful error message.
+	if len(rawCSR.CSR) >= 10 && rawCSR.CSR[8] == 2 && rawCSR.CSR[9] == 0 {
+		logEvent.AddError("Pre-1.0.2 OpenSSL malformed CSR")
+		if wfe.CheckMalformedCSR {
 			wfe.sendError(
 				response,
 				logEvent,
@@ -1099,7 +1113,16 @@ func (wfe *WebFrontEndImpl) Registration(ctx context.Context, logEvent *requestE
 		return
 	}
 
-	if len(update.Agreement) > 0 && update.Agreement != wfe.SubscriberAgreementURL {
+	// If a user POSTs their registration object including a previously valid
+	// agreement URL but that URL has since changed we will fail out here
+	// since the update agreement URL doesn't match the current URL. To fix that we
+	// only fail if the sent URL doesn't match the currently valid agreement URL
+	// and it doesn't match the URL currently stored in the registration
+	// in the database. The RA understands the user isn't actually trying to
+	// update the agreement but since we do an early check here in order to prevent
+	// extraneous requests to the RA we have to add this bypass.
+	if len(update.Agreement) > 0 && update.Agreement != currReg.Agreement &&
+		update.Agreement != wfe.SubscriberAgreementURL {
 		msg := fmt.Sprintf("Provided agreement URL [%s] does not match current agreement URL [%s]", update.Agreement, wfe.SubscriberAgreementURL)
 		logEvent.AddError(msg)
 		wfe.sendError(response, logEvent, probs.Malformed(msg), nil)
@@ -1135,6 +1158,44 @@ func (wfe *WebFrontEndImpl) Registration(ctx context.Context, logEvent *requestE
 	response.Write(jsonReply)
 }
 
+func (wfe *WebFrontEndImpl) deactivateAuthorization(ctx context.Context, authz *core.Authorization, logEvent *requestEvent, response http.ResponseWriter, request *http.Request) bool {
+	body, _, reg, prob := wfe.verifyPOST(ctx, logEvent, request, true, core.ResourceAuthz)
+	addRequesterHeader(response, logEvent.Requester)
+	if prob != nil {
+		wfe.sendError(response, logEvent, prob, nil)
+		return false
+	}
+	if reg.ID != authz.RegistrationID {
+		logEvent.AddError("registration ID doesn't match ID for authorization")
+		wfe.sendError(response, logEvent, probs.Unauthorized("Registration ID doesn't match ID for authorization"), nil)
+		return false
+	}
+	var req struct {
+		Status core.AcmeStatus
+	}
+	err := json.Unmarshal(body, &req)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.Malformed("Error unmarshaling JSON"), err)
+		return false
+	}
+	if req.Status != core.StatusDeactivated {
+		logEvent.AddError("invalid status value")
+		wfe.sendError(response, logEvent, probs.Malformed("Invalid status value"), err)
+		return false
+	}
+	err = wfe.RA.DeactivateAuthorization(ctx, *authz)
+	if err != nil {
+		logEvent.AddError("unable to deactivate authorization", err)
+		wfe.sendError(response, logEvent, core.ProblemDetailsForError(err, "Error deactivating authorization"), err)
+		return false
+	}
+	// Since the authorization passed to DeactivateAuthorization isn't
+	// mutated locally by the function we must manually set the status
+	// here before displaying the authorization to the user
+	authz.Status = core.StatusDeactivated
+	return true
+}
+
 // Authorization is used by clients to submit an update to one of their
 // authorizations.
 func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *requestEvent, response http.ResponseWriter, request *http.Request) {
@@ -1159,6 +1220,15 @@ func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *request
 		logEvent.AddError(msg)
 		wfe.sendError(response, logEvent, probs.NotFound("Expired authorization"), nil)
 		return
+	}
+
+	if wfe.AllowAuthzDeactivation && request.Method == "POST" {
+		// If the deactivation fails return early as errors and return codes
+		// have already been set. Otherwise continue so that the user gets
+		// sent the deactivated authorization.
+		if !wfe.deactivateAuthorization(ctx, &authz, logEvent, response, request) {
+			return
+		}
 	}
 
 	wfe.prepAuthorizationForDisplay(request, &authz)
