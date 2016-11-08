@@ -9,8 +9,10 @@ import (
 	"github.com/jmhodges/clock"
 
 	"github.com/letsencrypt/boulder/bdns"
+	caPB "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/metrics"
@@ -41,6 +43,7 @@ type config struct {
 		DNSTries int
 
 		VAService *cmd.GRPCClientConfig
+		CAService *cmd.GRPCClientConfig
 
 		MaxNames     int
 		DoNotForceCN bool
@@ -62,6 +65,8 @@ type config struct {
 		// the pending state. If you can't respond to a challenge this quickly, then
 		// you need to request a new challenge.
 		PendingAuthorizationLifetimeDays int
+
+		Features map[string]bool
 	}
 
 	PA cmd.PAConfig
@@ -86,12 +91,14 @@ func main() {
 	}
 
 	var c config
-	err := cmd.ReadJSONFile(*configFile, &c)
+	err := cmd.ReadConfigFile(*configFile, &c)
 	cmd.FailOnError(err, "Reading JSON config file into config structure")
 
-	go cmd.DebugServer(c.RA.DebugAddr)
+	err = features.Set(c.RA.Features)
+	cmd.FailOnError(err, "Failed to set feature flags")
 
 	stats, logger := cmd.StatsAndLogging(c.Statsd, c.Syslog)
+	scope := metrics.NewStatsdScope(stats, "RA")
 	defer logger.AuditPanic()
 	logger.Info(cmd.VersionString(clientName))
 
@@ -107,23 +114,28 @@ func main() {
 	err = pa.SetHostnamePolicyFile(c.RA.HostnamePolicyFile)
 	cmd.FailOnError(err, "Couldn't load hostname policy file")
 
-	go cmd.ProfileCmd("RA", stats)
-
 	amqpConf := c.RA.AMQP
 	var vac core.ValidationAuthority
 	if c.RA.VAService != nil {
-		conn, err := bgrpc.ClientSetup(c.RA.VAService)
+		conn, err := bgrpc.ClientSetup(c.RA.VAService, scope)
 		cmd.FailOnError(err, "Unable to create VA client")
 		vac = bgrpc.NewValidationAuthorityGRPCClient(conn)
 	} else {
-		vac, err = rpc.NewValidationAuthorityClient(clientName, amqpConf, stats)
+		vac, err = rpc.NewValidationAuthorityClient(clientName, amqpConf, scope)
 		cmd.FailOnError(err, "Unable to create VA client")
 	}
 
-	cac, err := rpc.NewCertificateAuthorityClient(clientName, amqpConf, stats)
-	cmd.FailOnError(err, "Unable to create CA client")
+	var cac core.CertificateAuthority
+	if c.RA.CAService != nil {
+		conn, err := bgrpc.ClientSetup(c.RA.CAService, scope)
+		cmd.FailOnError(err, "Unable to create CA client")
+		cac = bgrpc.NewCertificateAuthorityClient(caPB.NewCertificateAuthorityClient(conn), c.RA.CAService.Timeout.Duration)
+	} else {
+		cac, err = rpc.NewCertificateAuthorityClient(clientName, amqpConf, scope)
+		cmd.FailOnError(err, "Unable to create CA client")
+	}
 
-	sac, err := rpc.NewStorageAuthorityClient(clientName, amqpConf, stats)
+	sac, err := rpc.NewStorageAuthorityClient(clientName, amqpConf, scope)
 	cmd.FailOnError(err, "Unable to create SA client")
 
 	// TODO(patf): remove once RA.authorizationLifetimeDays is deployed
@@ -141,7 +153,7 @@ func main() {
 	rai := ra.NewRegistrationAuthorityImpl(
 		clock.Default(),
 		logger,
-		stats,
+		scope,
 		c.RA.MaxContactsPerRegistration,
 		goodkey.NewKeyPolicy(),
 		c.RA.MaxNames,
@@ -156,7 +168,6 @@ func main() {
 
 	raDNSTimeout, err := time.ParseDuration(c.Common.DNSTimeout)
 	cmd.FailOnError(err, "Couldn't parse RA DNS timeout")
-	scoped := metrics.NewStatsdScope(stats, "RA", "DNS")
 	dnsTries := c.RA.DNSTries
 	if dnsTries < 1 {
 		dnsTries = 1
@@ -166,14 +177,14 @@ func main() {
 			raDNSTimeout,
 			[]string{c.Common.DNSResolver},
 			nil,
-			scoped,
+			scope,
 			clock.Default(),
 			dnsTries)
 	} else {
 		rai.DNSResolver = bdns.NewTestDNSResolverImpl(
 			raDNSTimeout,
 			[]string{c.Common.DNSResolver},
-			scoped,
+			scope,
 			clock.Default(),
 			dnsTries)
 	}
@@ -182,10 +193,16 @@ func main() {
 	rai.CA = cac
 	rai.SA = sac
 
-	ras, err := rpc.NewAmqpRPCServer(amqpConf, c.RA.MaxConcurrentRPCServerRequests, stats, logger)
+	err = rai.UpdateIssuedCountForever()
+	cmd.FailOnError(err, "Updating total issuance count")
+
+	ras, err := rpc.NewAmqpRPCServer(amqpConf, c.RA.MaxConcurrentRPCServerRequests, scope, logger)
 	cmd.FailOnError(err, "Unable to create RA RPC server")
 	err = rpc.NewRegistrationAuthorityServer(ras, rai, logger)
 	cmd.FailOnError(err, "Unable to setup RA RPC server")
+
+	go cmd.DebugServer(c.RA.DebugAddr)
+	go cmd.ProfileCmd(scope)
 
 	err = ras.Start(amqpConf)
 	cmd.FailOnError(err, "Unable to run RA RPC server")

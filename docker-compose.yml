@@ -1,6 +1,16 @@
 boulder:
     build: .
     dockerfile: Dockerfile
+    environment:
+        FAKE_DNS: 127.0.0.1
+        PKCS11_PROXY_SOCKET: tcp://boulder-hsm:5657
+    volumes:
+      - $GOPATH:/go/
+      - /tmp:/tmp
+    net: bridge
+    extra_hosts:
+      - le.wtf:127.0.0.1
+      - boulder:127.0.0.1
     ports:
       - 4000:4000 # ACME
       - 4002:4002 # OCSP
@@ -27,7 +37,7 @@ boulder:
 bhsm:
     # To minimize the fetching of various layers this should match
     # the FROM image and tag in boulder/Dockerfile
-    image: letsencrypt/boulder-tools:2016-08-03
+    image: letsencrypt/boulder-tools:2016-10-19
     environment:
         PKCS11_DAEMON_SOCKET: tcp://0.0.0.0:5657
     command: /usr/local/bin/pkcs11-daemon /usr/lib/softhsm/libsofthsm.so

@@ -11,6 +11,7 @@ import (
 	gorp "gopkg.in/gorp.v1"
 
 	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/features"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 )
@@ -66,9 +67,24 @@ func NewDbMapFromConfig(config *mysql.Config, maxOpenConns int) (*gorp.DbMap, er
 	dbmap := &gorp.DbMap{Db: db, Dialect: dialect, TypeConverter: BoulderTypeConverter{}}
 
 	initTables(dbmap)
-	_, err = dbmap.Exec("SET sql_mode = 'STRICT_ALL_TABLES';")
+	_, err = dbmap.Exec("SET SESSION sql_mode = 'STRICT_ALL_TABLES';")
 	if err != nil {
 		return nil, err
+	}
+	// If a read timeout is set, we set max_statement_time to 95% of that, and
+	// long_query_time to 80% of that. That way we get logs of queries that are
+	// close to timing out but not yet doing so, and our queries get stopped by
+	// max_statement_time before timing out the read. This generates clearer
+	// errors, and avoids unnecessary reconnects.
+	if config.ReadTimeout != 0 {
+		// In MariaDB, max_statement_time and long_query_time are both seconds.
+		// Note: in MySQL (which we don't use), max_statement_time is millis.
+		readTimeout := config.ReadTimeout.Seconds()
+		_, err := dbmap.Exec("SET SESSION max_statement_time = ?, long_query_time = ?;",
+			readTimeout*0.95, readTimeout*0.80)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return dbmap, err
@@ -167,7 +183,12 @@ func ReportDbConnCount(dbMap *gorp.DbMap, statter metrics.Scope) {
 // autoincremented value that resulted from the insert. See
 // https://godoc.org/github.com/coopernurse/gorp#DbMap.Insert
 func initTables(dbMap *gorp.DbMap) {
-	regTable := dbMap.AddTableWithName(regModel{}, "registrations").SetKeys(true, "ID")
+	var regTable *gorp.TableMap
+	if features.Enabled(features.AllowAccountDeactivation) {
+		regTable = dbMap.AddTableWithName(regModelv2{}, "registrations").SetKeys(true, "ID")
+	} else {
+		regTable = dbMap.AddTableWithName(regModelv1{}, "registrations").SetKeys(true, "ID")
+	}
 	regTable.SetVersionCol("LockCol")
 	regTable.ColMap("Key").SetNotNull(true)
 	regTable.ColMap("KeySHA256").SetNotNull(true).SetUnique(true)
@@ -181,4 +202,11 @@ func initTables(dbMap *gorp.DbMap) {
 	dbMap.AddTableWithName(core.CRL{}, "crls").SetKeys(false, "Serial")
 	dbMap.AddTableWithName(core.SignedCertificateTimestamp{}, "sctReceipts").SetKeys(true, "ID").SetVersionCol("LockCol")
 	dbMap.AddTableWithName(core.FQDNSet{}, "fqdnSets").SetKeys(true, "ID")
+
+	// TODO(@cpu): Delete these table maps when the `CertStatusOptimizationsMigrated` feature flag is removed
+	if features.Enabled(features.CertStatusOptimizationsMigrated) {
+		dbMap.AddTableWithName(certStatusModelv2{}, "certificateStatus").SetKeys(false, "Serial").SetVersionCol("LockCol")
+	} else {
+		dbMap.AddTableWithName(certStatusModelv1{}, "certificateStatus").SetKeys(false, "Serial").SetVersionCol("LockCol")
+	}
 }

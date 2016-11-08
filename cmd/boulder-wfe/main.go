@@ -10,6 +10,7 @@ import (
 	"github.com/jmhodges/clock"
 
 	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
@@ -40,6 +41,8 @@ type config struct {
 		CheckMalformedCSR      bool
 		AcceptRevocationReason bool
 		AllowAuthzDeactivation bool
+
+		Features map[string]bool
 	}
 
 	Statsd cmd.StatsdConfig
@@ -54,7 +57,7 @@ type config struct {
 	}
 }
 
-func setupWFE(c config, logger blog.Logger, stats metrics.Statter) (*rpc.RegistrationAuthorityClient, *rpc.StorageAuthorityClient) {
+func setupWFE(c config, logger blog.Logger, stats metrics.Scope) (*rpc.RegistrationAuthorityClient, *rpc.StorageAuthorityClient) {
 	amqpConf := c.WFE.AMQP
 	rac, err := rpc.NewRegistrationAuthorityClient(clientName, amqpConf, stats)
 	cmd.FailOnError(err, "Unable to create RA client")
@@ -74,18 +77,20 @@ func main() {
 	}
 
 	var c config
-	err := cmd.ReadJSONFile(*configFile, &c)
+	err := cmd.ReadConfigFile(*configFile, &c)
 	cmd.FailOnError(err, "Reading JSON config file into config structure")
 
-	go cmd.DebugServer(c.WFE.DebugAddr)
+	err = features.Set(c.WFE.Features)
+	cmd.FailOnError(err, "Failed to set feature flags")
 
 	stats, logger := cmd.StatsAndLogging(c.Statsd, c.Syslog)
+	scope := metrics.NewStatsdScope(stats, "WFE")
 	defer logger.AuditPanic()
 	logger.Info(cmd.VersionString(clientName))
 
-	wfe, err := wfe.NewWebFrontEndImpl(stats, clock.Default(), goodkey.NewKeyPolicy(), logger)
+	wfe, err := wfe.NewWebFrontEndImpl(scope, clock.Default(), goodkey.NewKeyPolicy(), logger)
 	cmd.FailOnError(err, "Unable to create WFE")
-	rac, sac := setupWFE(c, logger, stats)
+	rac, sac := setupWFE(c, logger, scope)
 	wfe.RA = rac
 	wfe.SA = sac
 
@@ -111,14 +116,12 @@ func main() {
 
 	logger.Info(fmt.Sprintf("WFE using key policy: %#v", goodkey.NewKeyPolicy()))
 
-	go cmd.ProfileCmd("WFE", stats)
-
 	// Set up paths
 	wfe.BaseURL = c.Common.BaseURL
 	h, err := wfe.Handler()
 	cmd.FailOnError(err, "Problem setting up HTTP handlers")
 
-	httpMonitor := metrics.NewHTTPMonitor(stats, h, "WFE")
+	httpMonitor := metrics.NewHTTPMonitor(scope, h)
 
 	logger.Info(fmt.Sprintf("Server running, listening on %s...\n", c.WFE.ListenAddress))
 	srv := &http.Server{
@@ -126,10 +129,13 @@ func main() {
 		Handler: httpMonitor,
 	}
 
+	go cmd.DebugServer(c.WFE.DebugAddr)
+	go cmd.ProfileCmd(scope)
+
 	hd := &httpdown.HTTP{
 		StopTimeout: c.WFE.ShutdownStopTimeout.Duration,
 		KillTimeout: c.WFE.ShutdownKillTimeout.Duration,
-		Stats:       metrics.NewFBAdapter(stats, "WFE", clock.Default()),
+		Stats:       metrics.NewFBAdapter(scope, clock.Default()),
 	}
 	err = httpdown.ListenAndServe(srv, hd)
 	cmd.FailOnError(err, "Error starting HTTP server")
