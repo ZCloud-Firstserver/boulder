@@ -19,6 +19,12 @@ COPY . .
 RUN mkdir bin
 RUN GOBIN=/usr/local/bin go install ./cmd/rabbitmq-setup
 
+#APPEND Localy# Use specific settings for local development
+#APPEND Localy# Should update common secction.
+COPY ./local/config /go/src/github.com/letsencrypt/boulder/test/config
+COPY ./local/config-next /go/src/github.com/letsencrypt/boulder/test/config-next
+COPY ./local/rate-limit-policies.yml /go/src/github.com/letsencrypt/boulder/test/rate-limit-policies.yml
+
 RUN chown -R buser /go/
 
 ENTRYPOINT [ "./test/entrypoint.sh" ]

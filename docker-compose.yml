@@ -7,7 +7,6 @@ boulder:
     volumes:
       # - $GOPATH:/go/
       - /tmp:/tmp
-    net: bridge
     extra_hosts:
       - le.wtf:127.0.0.1
       - boulder:127.0.0.1
@@ -39,14 +38,12 @@ bhsm:
       - 5657
 bmysql:
     image: mariadb:10.1
-    net: bridge
     environment:
         MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
     command: mysqld --bind-address=0.0.0.0
     log_driver: none
 brabbitmq:
     image: rabbitmq:3
-    net: bridge
     environment:
         RABBITMQ_NODE_IP_ADDRESS: "0.0.0.0"
     log_driver: none
