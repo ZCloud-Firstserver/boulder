@@ -12,9 +12,22 @@
 
 これらをローカル向けの値などに変更します。
 
+- ポート4000になっている項目(`boulder:4000`)のURLを自分のものに書き換える
+- ほか、`issuer_urls`, `ocsp_url`
+- 環境によっては `dnsResolver`
+
 ## compose up
+
+あとは起動します。
 
 ```
 docker-compose build
-docker-compose up
+docker-compose up -d
 ```
+
+設定を一部上書きするならこんな感じです。
+
+```
+docker-compose -f docker-compose.yml -f local/compose-override.yml up -d
+```
+
