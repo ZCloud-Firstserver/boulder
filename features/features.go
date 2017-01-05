@@ -16,6 +16,8 @@ const (
 	AllowAccountDeactivation
 	CertStatusOptimizationsMigrated
 	AllowKeyRollover
+	ResubmitMissingSCTsOnly
+	GoogleSafeBrowsingV4
 )
 
 // List of features and their default value, protected by fMu
@@ -25,6 +27,8 @@ var features = map[FeatureFlag]bool{
 	AllowAccountDeactivation:        false,
 	CertStatusOptimizationsMigrated: false,
 	AllowKeyRollover:                false,
+	ResubmitMissingSCTsOnly:         false,
+	GoogleSafeBrowsingV4:            false,
 }
 
 var fMu = new(sync.RWMutex)

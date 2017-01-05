@@ -2,12 +2,12 @@
   "publisher": {
     "maxConcurrentRPCServerRequests": 16,
     "submissionTimeout": "5s",
-    "debugAddr": "localhost:8009",
+    "debugAddr": ":8009",
     "grpc": {
       "address": "boulder:9091",
       "clientIssuerPath": "test/grpc-creds/minica.pem",
-      "serverCertificatePath": "test/grpc-creds/boulder-server/cert.pem",
-      "serverKeyPath": "test/grpc-creds/boulder-server/key.pem",
+      "serverCertificatePath": "test/grpc-creds/publisher.boulder/cert.pem",
+      "serverKeyPath": "test/grpc-creds/publisher.boulder/key.pem",
       "clientNames": [
         "boulder-client"
       ]
