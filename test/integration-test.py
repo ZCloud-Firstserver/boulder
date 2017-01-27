@@ -5,6 +5,7 @@ import base64
 import datetime
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -199,12 +200,12 @@ def run_node_test(domain, chall_type, expected_ct_submissions):
     last_reminder = expiry + datetime.timedelta(days=-2)
     try:
         urllib2.urlopen("http://localhost:9381/clear", data='')
-        if subprocess.Popen(
-                (('FAKECLOCK=`date -d "%s"` ./bin/expiration-mailer --config test/config/expiration-mailer.json && ' * 3) + 'true') %
-                (no_reminder.isoformat(), first_reminder.isoformat(), last_reminder.isoformat()),
-                shell=True).wait() != 0:
-            print("\nExpiry mailer failed")
-            return MAILER_FAILED
+        get_future_output('./bin/expiration-mailer --config %s/expiration-mailer.json' %
+            default_config_dir, no_reminder)
+        get_future_output('./bin/expiration-mailer --config %s/expiration-mailer.json' %
+            default_config_dir, first_reminder)
+        get_future_output('./bin/expiration-mailer --config %s/expiration-mailer.json' %
+            default_config_dir, last_reminder)
         resp = urllib2.urlopen("http://localhost:9381/count?to=%s" % email_addr)
         mailcount = int(resp.read())
         if mailcount != 2:
@@ -405,7 +406,8 @@ def main():
             print("\n Installing NPM modules failed")
             die(ExitStatus.Error)
         # Pick a random hostname so we don't run into certificate rate limiting.
-        domain = "www." + subprocess.check_output("openssl rand -hex 6", shell=True).strip() + "-TEST.com"
+        domains = "www.%x-TEST.com,%x-test.com" % (
+            random.randrange(2**32), random.randrange(2**32))
         challenge_types = ["http-01", "dns-01"]
 
         expected_ct_submissions = 1
@@ -414,7 +416,7 @@ def main():
         if int(submissionStr) > 0:
             expected_ct_submissions = int(submissionStr)+1
         for chall_type in challenge_types:
-            if run_node_test(domain, chall_type, expected_ct_submissions) != 0:
+            if run_node_test(domains, chall_type, expected_ct_submissions) != 0:
                 die(ExitStatus.NodeFailure)
             expected_ct_submissions += 1
 
@@ -423,7 +425,7 @@ def main():
             die(ExitStatus.NodeFailure)
 
         if run_node_test("bad-caa-reserved.com", challenge_types[0], expected_ct_submissions) != ISSUANCE_FAILED:
-            print("\nIssused certificate for domain with bad CAA records")
+            print("\nIssued certificate for domain with bad CAA records")
             die(ExitStatus.NodeFailure)
 
         run_expired_authz_purger_test()

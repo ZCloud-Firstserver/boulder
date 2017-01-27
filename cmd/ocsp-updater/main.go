@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/md5"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
@@ -55,7 +57,7 @@ type OCSPUpdater struct {
 
 	// Used to calculate how far back stale OCSP responses should be looked for
 	ocspMinTimeToExpiry time.Duration
-	// Used to caculate how far back in time the findStaleOCSPResponse will look
+	// Used to calculate how far back in time the findStaleOCSPResponse will look
 	ocspStaleMaxAge time.Duration
 	// Used to calculate how far back missing SCT receipts should be looked for
 	oldestIssuedSCT time.Duration
@@ -198,6 +200,21 @@ func newUpdater(
 	return &updater, nil
 }
 
+func reverseBytes(b []byte) []byte {
+	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+		b[i], b[j] = b[j], b[i]
+	}
+	return b
+}
+
+func generatePOSTURL(der []byte, ocspServer string) string {
+	// Generate POST url, format is the URL that was POST'd to with a query string with
+	// the parameter 'body-mdy' and the value of the first two uint32s in little endian
+	// order in hex of the MD5 hash of the OCSP request body.
+	hash := md5.Sum(der)
+	return fmt.Sprintf("%s?body-mdy=%x%x", ocspServer, reverseBytes(hash[0:4]), reverseBytes(hash[4:8]))
+}
+
 // sendPurge should only be called as a Goroutine as it will block until the purge
 // request is successful
 func (updater *OCSPUpdater) sendPurge(der []byte) {
@@ -213,18 +230,18 @@ func (updater *OCSPUpdater) sendPurge(der []byte) {
 		return
 	}
 
-	// Create a GET style OCSP url for each endpoint in cert.OCSPServer (still waiting
-	// on word from Akamai on how to properly purge cached POST requests, for now just
-	// do GET)
+	// Create a GET and special Akamai POST style OCSP url for each endpoint in cert.OCSPServer
 	urls := []string{}
 	for _, ocspServer := range cert.OCSPServer {
 		if !strings.HasSuffix(ocspServer, "/") {
 			ocspServer += "/"
 		}
+		// Generate GET url
 		urls = append(
 			urls,
 			fmt.Sprintf("%s%s", ocspServer, url.QueryEscape(base64.StdEncoding.EncodeToString(req))),
 		)
+		urls = append(urls, generatePOSTURL(der, ocspServer))
 	}
 
 	err = updater.ccu.Purge(urls)
@@ -333,11 +350,6 @@ func (updater *OCSPUpdater) generateResponse(ctx context.Context, status core.Ce
 		return nil, err
 	}
 
-	_, err = x509.ParseCertificate(cert.DER)
-	if err != nil {
-		return nil, err
-	}
-
 	signRequest := core.OCSPSigningRequest{
 		CertDER:   cert.DER,
 		Reason:    status.RevokedReason,
@@ -352,11 +364,6 @@ func (updater *OCSPUpdater) generateResponse(ctx context.Context, status core.Ce
 
 	status.OCSPLastUpdated = updater.clk.Now()
 	status.OCSPResponse = ocspResponse
-
-	// Purge OCSP response from CDN, gated on client having been initialized
-	if updater.ccu != nil {
-		go updater.sendPurge(cert.DER)
-	}
 
 	return &status, nil
 }
@@ -492,19 +499,20 @@ func (updater *OCSPUpdater) generateOCSPResponses(ctx context.Context, statuses 
 	wait := func() {
 		sem <- 1 // Block until there's capacity.
 	}
-	done := func() {
+	done := func(start time.Time) {
 		<-sem // Indicate there's more capacity.
+		stats.TimingDuration("GenerateAndStore", time.Since(start))
 	}
 
 	work := func(status core.CertificateStatus) {
-		defer done()
+		defer done(updater.clk.Now())
 		meta, err := updater.generateResponse(ctx, status)
 		if err != nil {
 			updater.log.AuditErr(fmt.Sprintf("Failed to generate OCSP response: %s", err))
 			stats.Inc("Errors.ResponseGeneration", 1)
 			return
 		}
-		updater.stats.Inc("GeneratedResponses", 1)
+		stats.Inc("GeneratedResponses", 1)
 		err = updater.storeResponse(meta)
 		if err != nil {
 			updater.log.AuditErr(fmt.Sprintf("Failed to store OCSP response: %s", err))
@@ -768,24 +776,43 @@ func setupClients(c cmd.OCSPUpdaterConfig, stats metrics.Scope) (
 ) {
 	amqpConf := c.AMQP
 
+	// TODO(jsha): Publisher is currently configured in production using old-style
+	// GRPC config fields. Remove this once production is switched over.
+	if c.Publisher != nil && c.TLS.CertFile == nil {
+		c.TLS = cmd.TLSConfig{
+			CertFile:   &c.Publisher.ClientCertificatePath,
+			KeyFile:    &c.Publisher.ClientKeyPath,
+			CACertFile: &c.Publisher.ServerIssuerPath,
+		}
+	}
+
+	var tls *tls.Config
+	var err error
+	if c.TLS.CertFile != nil {
+		tls, err = c.TLS.Load()
+		cmd.FailOnError(err, "TLS config")
+	}
 	var cac core.CertificateAuthority
-	if c.CAService != nil {
-		conn, err := bgrpc.ClientSetup(c.CAService, stats)
+	if c.OCSPGeneratorService != nil {
+		conn, err := bgrpc.ClientSetup(c.OCSPGeneratorService, tls, stats)
 		cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to CA")
-		cac = bgrpc.NewCertificateAuthorityClient(capb.NewCertificateAuthorityClient(conn))
+		// Make a CA client that is only capable of signing OCSP.
+		// TODO(jsha): Once we've fully moved to gRPC, replace this
+		// with a plain caPB.NewOCSPGeneratorClient.
+		cac = bgrpc.NewCertificateAuthorityClient(nil, capb.NewOCSPGeneratorClient(conn))
 	} else {
 		var err error
 		cac, err = rpc.NewCertificateAuthorityClient(clientName, amqpConf, stats)
 		cmd.FailOnError(err, "Unable to create CA client")
 	}
 
-	conn, err := bgrpc.ClientSetup(c.Publisher, stats)
+	conn, err := bgrpc.ClientSetup(c.Publisher, tls, stats)
 	cmd.FailOnError(err, "Failed to load credentials and create connection to service")
 	pubc := bgrpc.NewPublisherClientWrapper(pubPB.NewPublisherClient(conn))
 
 	var sac core.StorageAuthority
 	if c.SAService != nil {
-		conn, err := bgrpc.ClientSetup(c.SAService, stats)
+		conn, err := bgrpc.ClientSetup(c.SAService, tls, stats)
 		cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
 		sac = bgrpc.NewStorageAuthorityClient(sapb.NewStorageAuthorityClient(conn))
 	} else {

@@ -443,7 +443,7 @@ func TestTLSSNI(t *testing.T) {
 
 	_, prob := va.validateTLSSNI01(ctx, ident, chall)
 	if prob != nil {
-		t.Fatalf("Unexpected failre in validateTLSSNI01: %s", prob)
+		t.Fatalf("Unexpected failure in validateTLSSNI01: %s", prob)
 	}
 	test.AssertEquals(t, len(log.GetAllMatching(`Resolved addresses for localhost \[using 127.0.0.1\]: \[127.0.0.1\]`)), 1)
 	if len(log.GetAllMatching(`challenge for localhost received certificate \(1 of 1\): cert=\[`)) != 1 {
@@ -492,6 +492,20 @@ func TestTLSSNI(t *testing.T) {
 		t.Fatalf("Server's down; expected refusal. Where did we connect?")
 	}
 	test.AssertEquals(t, prob.Type, probs.ConnectionProblem)
+
+	httpOnly := httpSrv(t, "")
+	defer httpOnly.Close()
+	port, err = getPort(httpOnly)
+	test.AssertNotError(t, err, "failed to get test server port")
+	va.tlsPort = port
+
+	log.Clear()
+	_, err = va.validateTLSSNI01(ctx, ident, chall)
+	test.AssertError(t, err, "TLS SNI validation passed when talking to a HTTP-only server")
+	test.Assert(t, strings.HasSuffix(
+		err.Error(),
+		"Server only speaks HTTP, not TLS",
+	), "validateTLSSNI01 didn't return useful error")
 }
 
 func brokenTLSSrv() *httptest.Server {

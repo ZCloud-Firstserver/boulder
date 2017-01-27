@@ -43,6 +43,8 @@ def start(race_detection):
     startup. Anything that did start before this point can be cleaned
     up explicitly by calling stop(), or automatically atexit.
     """
+    signal.signal(signal.SIGTERM, lambda _, __: stop())
+    signal.signal(signal.SIGINT, lambda _, __: stop())
     global processes
     forward()
     progs = [
@@ -133,6 +135,14 @@ def check():
 
 @atexit.register
 def stop():
+    # When we are about to exit, send SIGKILL to each subprocess and wait for
+    # them to nicely die. This reflects the restart process in prod and allows
+    # us to exercise the graceful shutdown code paths.
+    # TODO(jsha): Switch to SIGTERM once we fix
+    # https://github.com/letsencrypt/boulder/issues/2410 and remove AMQP, to
+    # make shutdown less noisy.
     for p in processes:
         if p.poll() is None:
-            p.kill()
+            p.send_signal(signal.SIGKILL)
+    for p in processes:
+        p.wait()
