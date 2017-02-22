@@ -48,6 +48,9 @@ def start(race_detection):
     global processes
     forward()
     progs = [
+        # The gsb-test-srv needs to be started before the VA or its intial DB
+        # update will fail and all subsequent lookups will be invalid
+        'gsb-test-srv -apikey my-voice-is-my-passport',
         'boulder-sa --config %s' % os.path.join(default_config_dir, "sa.json"),
         'boulder-wfe --config %s' % os.path.join(default_config_dir, "wfe.json"),
         'boulder-ra --config %s' % os.path.join(default_config_dir, "ra.json"),
@@ -80,7 +83,7 @@ def start(race_detection):
             # If one of the servers has died, quit immediately.
             if not check():
                 return False
-            ports = range(8000, 8005) + [4000]
+            ports = range(8000, 8005) + [4000, 4430]
             for debug_port in ports:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.connect(('localhost', debug_port))

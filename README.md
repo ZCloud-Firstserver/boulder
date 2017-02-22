@@ -41,6 +41,9 @@ container for service boulder" you should double check that your `$GOPATH`
 exists and doesn't contain any characters other than letters, numbers, `-`
 and `_`.
 
+If you have problems with Docker, you may want to try [removing all containers
+and volumes](https://www.digitalocean.com/community/tutorials/how-to-remove-docker-images-containers-and-volumes).
+
 By default, Boulder uses a fake DNS resolver that resolves all hostnames to
 127.0.0.1. This is suitable for running integration tests inside the Docker
 container. If you want Boulder to be able to communicate with a client running
@@ -128,6 +131,15 @@ or changed the password you may have to adjust the file or recreate the commands
 
 Install SoftHSM to store the CA private key in a way that can be accessed using
 PKCS#11. Then run ./test/make-softhsm.sh and follow its instructions.
+
+Install Python packages for integration test:
+
+    virtualenv venv
+    . venv/bin/activate
+    pip install -r test/requirements.txt
+    # If you want to develop against a locally modified Python acme package,
+    # this will install the package such that updates are reflected immediately:
+    pip install -e ~/certbot/acme[dev]
 
 Start all boulder components with test configs (Ctrl-C kills all):
 
@@ -237,3 +249,11 @@ you will get conflicting types between our vendored version and the cfssl vendor
 
     godep update golang.org/x/crypto/...  github.com/cloudflare/cfssl/... github.com/google/certificate-transparency/...
     godep save ./...
+
+Adding RPCs
+-----------
+
+Boulder is moving towards using gRPC for all RPCs. To add a new RPC method, add
+it to the relevant .proto file, then run:
+
+    docker-compose run boulder go generate ./path/to/pkg/...
